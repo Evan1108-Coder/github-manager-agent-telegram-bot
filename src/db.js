@@ -130,6 +130,35 @@ function migrate(database) {
       finished_at TEXT,
       result TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS bot_messages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id TEXT NOT NULL,
+      message_id INTEGER,
+      kind TEXT NOT NULL,
+      content TEXT NOT NULL,
+      metadata TEXT,
+      sent_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_bot_messages_chat_sent ON bot_messages(chat_id, sent_at DESC);
+
+    CREATE TABLE IF NOT EXISTS digest_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id TEXT NOT NULL,
+      digest_date TEXT NOT NULL,
+      digest_kind TEXT NOT NULL,
+      position INTEGER NOT NULL,
+      item_id TEXT,
+      title TEXT NOT NULL,
+      url TEXT,
+      source TEXT,
+      metric TEXT,
+      summary TEXT,
+      raw_json TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_digest_items_lookup ON digest_items(chat_id, digest_date DESC, digest_kind, position);
+    CREATE INDEX IF NOT EXISTS idx_digest_items_id ON digest_items(chat_id, item_id);
   `);
 }
 
@@ -181,6 +210,107 @@ function getConversation(chatId, limit = 12) {
   `).all(String(chatId), limit).reverse();
 }
 
+// P1 fix: record outbound messages durably, covering all send paths (ctx.reply, bot.api.sendMessage, editMessageText).
+// This replaces the volatile actionlog Map. Call this BEFORE chunking and BEFORE HTML stripping.
+function recordBotMessage(chatId, { messageId = null, kind, content, metadata = null }) {
+  if (!chatId || !content) return;
+  const truncated = content.length > 16000;
+  const meta = metadata ? { ...metadata, truncated } : (truncated ? { truncated } : null);
+  openDb().prepare(`
+    INSERT INTO bot_messages (chat_id, message_id, kind, content, metadata)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(String(chatId), messageId, kind, String(content).slice(0, 16000), meta ? JSON.stringify(meta) : null);
+  // Prune to last 100 per chat to prevent unbounded growth.
+  openDb().prepare(`
+    DELETE FROM bot_messages
+    WHERE rowid IN (
+      SELECT rowid FROM bot_messages
+      WHERE chat_id = ?
+      ORDER BY sent_at DESC, rowid DESC
+      LIMIT -1 OFFSET 100
+    )
+  `).run(String(chatId));
+}
+
+// Get recent bot messages (replacement for actionlog evidenceSummary).
+function getRecentBotMessages(chatId, limit = 10) {
+  return openDb().prepare(`
+    SELECT kind, content, metadata, sent_at
+    FROM bot_messages
+    WHERE chat_id = ?
+    ORDER BY sent_at DESC, rowid DESC
+    LIMIT ?
+  `).all(String(chatId), limit).reverse();
+}
+
+// P1 fix: persist ordered digest items (trend projects, stats repos, daily commits, audit findings).
+// Enables "your second recommendation" / "tell me about #3" reference resolution.
+function recordDigestItems(chatId, { digestDate, digestKind, items }) {
+  if (!chatId || !items || !items.length) return;
+  const stmt = openDb().prepare(`
+    INSERT INTO digest_items (chat_id, digest_date, digest_kind, position, item_id, title, url, source, metric, summary, raw_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    stmt.run(
+      String(chatId),
+      digestDate,
+      digestKind,
+      i + 1, // 1-based position
+      item.id || null,
+      String(item.title || item.name || 'Untitled'),
+      item.url || null,
+      item.source || null,
+      item.metric || null,
+      item.summary || item.why || item.oneLiner || null,
+      JSON.stringify(item)
+    );
+  }
+}
+
+// Get digest items for a specific date and kind, or the most recent digest of that kind.
+function getDigestItems(chatId, { digestDate = null, digestKind = null, limit = 20 } = {}) {
+  let query = 'SELECT * FROM digest_items WHERE chat_id = ?';
+  const params = [String(chatId)];
+  if (digestDate) {
+    query += ' AND digest_date = ?';
+    params.push(digestDate);
+  }
+  if (digestKind) {
+    query += ' AND digest_kind = ?';
+    params.push(digestKind);
+  }
+  query += ' ORDER BY digest_date DESC, digest_kind, position LIMIT ?';
+  params.push(limit);
+  return openDb().prepare(query).all(...params);
+}
+
+// Resolve a reference like "second", "2nd", "#3", "last one" to a concrete digest item.
+// Returns the most recent matching item, or null.
+function resolveDigestReference(chatId, { position = null, digestKind = null, digestDate = null } = {}) {
+  let query = 'SELECT * FROM digest_items WHERE chat_id = ?';
+  const params = [String(chatId)];
+  if (digestDate) {
+    query += ' AND digest_date = ?';
+    params.push(digestDate);
+  } else {
+    // Default to today or most recent.
+    query += ' AND digest_date = (SELECT digest_date FROM digest_items WHERE chat_id = ? ORDER BY digest_date DESC LIMIT 1)';
+    params.push(String(chatId));
+  }
+  if (digestKind) {
+    query += ' AND digest_kind = ?';
+    params.push(digestKind);
+  }
+  if (position !== null) {
+    query += ' AND position = ?';
+    params.push(position);
+  }
+  query += ' ORDER BY digest_date DESC, position LIMIT 1';
+  return openDb().prepare(query).get(...params) || null;
+}
+
 module.exports = {
   openDb,
   getSetting,
@@ -188,4 +318,9 @@ module.exports = {
   addConversation,
   getConversation,
   recordTelemetry,
+  recordBotMessage,
+  getRecentBotMessages,
+  recordDigestItems,
+  getDigestItems,
+  resolveDigestReference,
 };

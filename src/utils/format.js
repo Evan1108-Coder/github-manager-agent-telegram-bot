@@ -37,16 +37,32 @@ function chunkText(text, limit = TELEGRAM_SAFE_LIMIT) {
 async function sendLong(ctxOrBot, chatIdOrText, maybeText, options = {}) {
   let send;
   let text;
+  let chatId;
   if (typeof maybeText === 'string') {
     const bot = ctxOrBot;
-    const chatId = chatIdOrText;
+    chatId = chatIdOrText;
     text = maybeText;
     send = chunk => bot.api.sendMessage(chatId, chunk, { parse_mode: 'HTML', disable_web_page_preview: true, ...options });
   } else {
     const ctx = ctxOrBot;
+    chatId = ctx.chat?.id;
     text = chatIdOrText;
     send = chunk => ctx.reply(chunk, { parse_mode: 'HTML', disable_web_page_preview: true, ...maybeText });
   }
+
+  // P1 fix: record the FULL message BEFORE chunking and BEFORE stripping, so follow-ups
+  // can reference it. This single chokepoint covers ctx.reply, bot.api.sendMessage,
+  // scheduled jobs, watches, and all other send paths that route through sendLong.
+  if (chatId && text) {
+    try {
+      const { recordBotMessage } = require('../db');
+      const kind = options.recordKind || 'reply';
+      recordBotMessage(chatId, { kind, content: text, metadata: options.recordMetadata || null });
+    } catch (err) {
+      // Swallow recording errors so a db failure doesn't block delivery.
+    }
+  }
+
   for (const chunk of chunkText(text)) {
     await send(chunk);
   }

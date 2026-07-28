@@ -1,5 +1,5 @@
 const { getConfig } = require('./config');
-const { openDb, getSetting, setSetting } = require('./db');
+const { openDb, getSetting, setSetting, recordDigestItems } = require('./db');
 const { GitHubClient } = require('./github/client');
 const { auditRepoPresentation, suspiciousCommitMessages } = require('./github/audit');
 const { chatJson, chat, chooseDefaultModel } = require('./llm/providers');
@@ -42,34 +42,57 @@ async function executeJob(job, bot) {
   if (!chatId) {
     throw new Error('No delivery chat yet — DM the bot once (any message) so it can learn where to send scheduled reports, or set TELEGRAM_CHAT_ID to your numeric chat id.');
   }
-  if (plan.kind === 'trend_digest') return sendLong(bot, chatId, await buildTrendDigest());
-  if (plan.kind === 'profile_update') return sendLong(bot, chatId, await runProfileUpdate());
-  if (plan.kind === 'daily_summary') return sendLong(bot, chatId, await buildDailySummary());
-  if (plan.kind === 'stats_report') return sendLong(bot, chatId, await buildStatsReport());
-  if (plan.kind === 'natural_request') return sendLong(bot, chatId, await runNaturalPlan(plan));
+  const opts = { recordKind: 'scheduled_job', recordMetadata: { job_id: job.id, job_kind: plan.kind } };
+  const deliver = async (result, digestKind) => {
+    const text = typeof result === 'string' ? result : result.text;
+    if (result && result.items && result.items.length) {
+      try {
+        recordDigestItems(chatId, { digestDate: todayStamp(), digestKind, items: result.items });
+      } catch (err) {}
+    }
+    return sendLong(bot, chatId, text, opts);
+  };
+  if (plan.kind === 'trend_digest') return deliver(await buildTrendDigest(), 'trend');
+  if (plan.kind === 'profile_update') return deliver(await runProfileUpdate(), 'profile_update');
+  if (plan.kind === 'daily_summary') return deliver(await buildDailySummary(), 'daily_summary');
+  if (plan.kind === 'stats_report') return deliver(await buildStatsReport(), 'stats');
+  if (plan.kind === 'natural_request') return deliver(await runNaturalPlan(plan), 'natural');
   if (plan.kind === 'snapshot_metric') {
     await runSnapshotMetric(plan);
     return;
   }
-  return sendLong(bot, chatId, `Scheduled job ran, but I do not know this plan kind yet: ${escapeHtml(plan.kind)}`);
+  return sendLong(bot, chatId, `Scheduled job ran, but I do not know this plan kind yet: ${escapeHtml(plan.kind)}`, opts);
 }
 
 async function buildTrendDigest() {
   const items = await fetchAllTrends();
   if (!items.length) return '<b>Morning Builder Trends</b>\nI could not fetch trend sources this time.';
   const model = chooseDefaultModel();
+  let json;
   if (!model) {
-    return renderTrendDigest(fallbackTrendDigest(items));
+    json = fallbackTrendDigest(items);
+  } else {
+    try {
+      json = await chatJson(model, [
+        { role: 'system', content: 'Return compact JSON only. You select developer trends that teach practical lessons for improving GitHub projects, READMEs, project ideas, and public presentation. ' + languagePolicy() },
+        { role: 'user', content: `Use these trend items and return JSON with projects[3]{title,url,why}, ideas[2]{title,summary}, takeaways[3] strings. Keep it concise.\n${JSON.stringify(items.slice(0, 30))}` },
+      ], { maxTokens: 1200 });
+    } catch (err) {
+      json = fallbackTrendDigest(items);
+    }
   }
-  try {
-    const json = await chatJson(model, [
-      { role: 'system', content: 'Return compact JSON only. You select developer trends that teach practical lessons for improving GitHub projects, READMEs, project ideas, and public presentation. ' + languagePolicy() },
-      { role: 'user', content: `Use these trend items and return JSON with projects[3]{title,url,why}, ideas[2]{title,summary}, takeaways[3] strings. Keep it concise.\n${JSON.stringify(items.slice(0, 30))}` },
-    ], { maxTokens: 1200 });
-    return renderTrendDigest(json);
-  } catch (err) {
-    return renderTrendDigest(fallbackTrendDigest(items));
+  const structured = [];
+  if (json.projects && json.projects.length) {
+    json.projects.slice(0, 3).forEach(p => {
+      structured.push({ id: null, title: p.title, url: p.url, source: p.source || 'trend_project', metric: null, summary: p.why || p.description || null });
+    });
   }
+  if (json.ideas && json.ideas.length) {
+    json.ideas.slice(0, 2).forEach(idea => {
+      structured.push({ id: null, title: idea.title, url: null, source: 'trend_idea', metric: null, summary: idea.summary || null });
+    });
+  }
+  return { text: renderTrendDigest(json), items: structured };
 }
 
 async function buildStatsReport() {
@@ -123,16 +146,24 @@ async function buildStatsReport() {
   if (trafficRows.length) notes.push(`Traffic checked for ${trafficRows.length} recent repos where GitHub allowed access.`);
   if (github.tokenExpiration) notes.push(`GitHub token expiration header: ${github.tokenExpiration}`);
   if (github.lastRateLimit?.remaining) notes.push(`GitHub API remaining this hour: ${github.lastRateLimit.remaining}/${github.lastRateLimit.limit}`);
-  return renderStatsReport({
-    totalStars,
-    totalForks,
-    totalViews,
-    totalClones,
-    starDelta: totalStars - previousTotalStars,
-    forkDelta: 0,
-    topMovement,
-    notes,
+  const structured = topMovement.slice(0, 10).map(item => {
+    const repo = current.find(c => c.name === item.name);
+    const metric = item.starDelta > 0 ? `+${item.starDelta} stars` : `${item.starDelta} stars`;
+    return { id: item.name, title: item.name, url: `https://github.com/${item.name}`, source: 'github_repo', metric, summary: null };
   });
+  return {
+    text: renderStatsReport({
+      totalStars,
+      totalForks,
+      totalViews,
+      totalClones,
+      starDelta: totalStars - previousTotalStars,
+      forkDelta: 0,
+      topMovement,
+      notes,
+    }),
+    items: structured,
+  };
 }
 
 async function buildDailySummary() {
@@ -159,11 +190,22 @@ async function buildDailySummary() {
     lines.push('\n🧪 <b>Commit notes</b>');
     oddCommits.slice(0, 5).forEach(item => lines.push(`- ${escapeHtml(item.repo)} ${escapeHtml(item.sha)}: ${escapeHtml(oneLine(item.message, 90))}`));
   }
+  const actions = [
+    'Check whether today changed repos need README/setup updates.',
+    'If a repo got meaningful work today, make sure its description still matches the actual project.',
+    'Add a demo/screenshot if the repo is meant to attract users.'
+  ];
   lines.push('\n🚀 <b>Best next actions</b>');
-  lines.push('- Check whether today’s changed repos need README/setup updates.');
-  lines.push('- If a repo got meaningful work today, make sure its description still matches the actual project.');
-  lines.push('- Add a demo/screenshot if the repo is meant to attract users.');
-  return lines.join('\n');
+  actions.forEach(a => lines.push(`- ${a}`));
+  const structured = touched.slice(0, 8).map(item => ({
+    id: item.repo.full_name,
+    title: item.repo.full_name,
+    url: item.repo.html_url,
+    source: 'github_repo',
+    metric: `${item.commits} commit(s)`,
+    summary: item.latest || null,
+  }));
+  return { text: lines.join('\n'), items: structured };
 }
 
 async function runProfileUpdate() {
@@ -348,6 +390,12 @@ async function auditOneRepo(repoName) {
   const repo = await github.getRepo(repoName);
   const readme = await github.getReadme(repoName).catch(() => ({ content: '' }));
   return renderAudit(repo, auditRepoPresentation(repo, readme.content));
+}
+
+function todayStamp() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
 module.exports = {

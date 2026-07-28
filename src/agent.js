@@ -139,17 +139,50 @@ async function handleTextInner(ctx, text, context = {}) {
 
   if (/\btrends?\b|builder trend|morning trend/i.test(normalized)) {
     await reply(ctx, '🧭 <b>Got it.</b> Fetching trend sources and compressing them into a short builder digest…');
-    return withFriendlyFailure(ctx, () => withTyping(ctx, async () => sendLong(ctx, await buildTrendDigest())));
+    return withFriendlyFailure(ctx, () => withTyping(ctx, async () => {
+      const result = await buildTrendDigest();
+      const text = typeof result === 'string' ? result : result.text;
+      if (result && result.items && result.items.length) {
+        try {
+          const { recordDigestItems } = require('./db');
+          const stamp = new Date().toISOString().slice(0, 10);
+          recordDigestItems(ctx.chat.id, { digestDate: stamp, digestKind: 'trend', items: result.items });
+        } catch {}
+      }
+      return sendLong(ctx, text);
+    }));
   }
 
   if (/daily summary|what did i do|summarize today|today on github/i.test(normalized)) {
-    await reply(ctx, '📌 <b>I’m checking today’s GitHub activity now…</b>');
-    return withFriendlyFailure(ctx, () => withTyping(ctx, async () => sendLong(ctx, await buildDailySummary())));
+    await reply(ctx, '📌 <b>Checking today GitHub activity now…</b>');
+    return withFriendlyFailure(ctx, () => withTyping(ctx, async () => {
+      const result = await buildDailySummary();
+      const text = typeof result === 'string' ? result : result.text;
+      if (result && result.items && result.items.length) {
+        try {
+          const { recordDigestItems } = require('./db');
+          const stamp = new Date().toISOString().slice(0, 10);
+          recordDigestItems(ctx.chat.id, { digestDate: stamp, digestKind: 'daily_summary', items: result.items });
+        } catch {}
+      }
+      return sendLong(ctx, text);
+    }));
   }
 
   if (/\b(stats|stars|popularity|views|forks)\b/i.test(normalized) && !/audit|readme/i.test(normalized)) {
-    await reply(ctx, '📊 <b>I’m checking GitHub stats and stored snapshots…</b>');
-    return withFriendlyFailure(ctx, () => withTyping(ctx, async () => sendLong(ctx, await buildStatsReport())));
+    await reply(ctx, '📊 <b>Checking GitHub stats and stored snapshots…</b>');
+    return withFriendlyFailure(ctx, () => withTyping(ctx, async () => {
+      const result = await buildStatsReport();
+      const text = typeof result === 'string' ? result : result.text;
+      if (result && result.items && result.items.length) {
+        try {
+          const { recordDigestItems } = require('./db');
+          const stamp = new Date().toISOString().slice(0, 10);
+          recordDigestItems(ctx.chat.id, { digestDate: stamp, digestKind: 'stats', items: result.items });
+        } catch {}
+      }
+      return sendLong(ctx, text);
+    }));
   }
 
   if (/profile.*update|update.*profile|profile readme/i.test(normalized)) {

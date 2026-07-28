@@ -28,12 +28,6 @@ function createBot(token) {
   // a group, so noisy chats can't hijack delivery).
   bot.use(async (ctx, next) => {
     captureOwnerChat(ctx);
-    const originalReply = ctx.reply.bind(ctx);
-    ctx.reply = async (text, options) => {
-      remember(ctx.chat?.id, { action: 'sent bot reply', evidence: String(text).replace(/<[^>]+>/g, '').slice(0, 1000), result: 'Recorded outgoing structured/command response for follow-up context.', cost: 'none' });
-      try { if (ctx.chat?.id) addConversation(ctx.chat.id, 'assistant', String(text).replace(/<[^>]+>/g, '')); } catch {}
-      return originalReply(text, options);
-    };
     return next();
   });
 
