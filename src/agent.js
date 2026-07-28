@@ -1,5 +1,5 @@
 const { getConfig } = require('./config');
-const { addConversation, getConversation, getSetting, setSetting, openDb, recordTelemetry } = require('./db');
+const { addConversation, getConversation, getSetting, setSetting, openDb, recordTelemetry, resolveDigestReference } = require('./db');
 const { GitHubClient } = require('./github/client');
 const { auditRepoPresentation } = require('./github/audit');
 const { chat, chooseDefaultModel, getAvailableModels } = require('./llm/providers');
@@ -253,13 +253,33 @@ async function generalAnswer(ctx, text, context = {}) {
   const history = getConversation(ctx.chat.id, 8);
   const recentEvidence = evidenceSummary(ctx.chat.id);
   const config = getConfig();
+
+  // Ordinal reference resolver: "tell me about the second project from this morning",
+  // "what was your first recommendation", "more about #2" -> look up digest item.
+  let resolvedRefContext = '';
+  try {
+    const t = String(text || '').toLowerCase();
+    const ORDINAL_WORDS = { first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, seventh: 7, eighth: 8, ninth: 9, tenth: 10, one: 1, two: 2, three: 3, four: 4, five: 5 };
+    let pos = null;
+    const m1 = t.match(/\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|one|two|three|four|five)\b/);
+    if (m1) pos = ORDINAL_WORDS[m1[1]];
+    const m2 = t.match(/\b([1-9])(st|nd|rd|th)\b/);
+    if (m2 && !pos) pos = Number(m2[1]);
+    const m3 = t.match(/\b(?:item|pick|recommendation|result|repo|project|#)\s*([1-9])\b/);
+    if (m3 && !pos) pos = Number(m3[1]);
+    const referential = /\b(that|it|this|tell me more|more about|details?|explain|the one|your|today|from this morning|earlier)\b/i.test(text) || /\b(pick|recommendation|result|item|project|repo)\b/i.test(text);
+    if (pos && referential) {
+      const item = resolveDigestReference(ctx.chat.id, { position: pos });
+      if (item) resolvedRefContext = `\nThe user is referring to digest item #${pos}: ${JSON.stringify(item)}\nUse this as the concrete subject for their question.`;
+    }
+  } catch {}
+
   const system = [
     'You are a personal GitHub agent in Telegram.',
     'Be natural, concise, honest, and practical.',
     'You can explain, plan, and suggest GitHub actions, but public-facing writes need approval unless low-risk and controlled.',
     'If the user asks during setup-like discussion, answer then bring them back to the current task.',
     'Do not claim you performed an action unless a tool/result says it happened.',
-    'You have no callable tools or functions in this chat — never emit tool-call or function-call markup; just reply in plain prose.',
     languagePolicy(),
   ].join(' ');
   try {
@@ -269,7 +289,7 @@ async function generalAnswer(ctx, text, context = {}) {
     const budgetMs = (config.llmTimeoutMs || 35000) + 5000;
     const response = await runWithDeadline(
       () => withTyping(ctx, () => chat(model, [
-        { role: 'system', content: system + ' For follow-up/status questions, use Recent recorded actions as evidence. Do not invent API quota, stats, or tool results; say what was actually checked.' },
+        { role: 'system', content: system + ' For follow-up/status questions, use Recent recorded actions as evidence. Do not invent API quota, stats, or tool results; say what was actually checked.' + resolvedRefContext },
         { role: 'user', content: `User GitHub: ${config.githubUsername || getSetting('github_username', 'unknown')}\nContext: ${JSON.stringify(context).slice(0, 1200)}\nRecent recorded actions:\n${recentEvidence}\nRecent chat: ${JSON.stringify(history).slice(0, 2500)}\nCurrent message: ${text}` },
       ], { maxTokens: 700 })),
       budgetMs,
