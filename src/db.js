@@ -159,7 +159,45 @@ function migrate(database) {
     );
     CREATE INDEX IF NOT EXISTS idx_digest_items_lookup ON digest_items(chat_id, digest_date DESC, digest_kind, position);
     CREATE INDEX IF NOT EXISTS idx_digest_items_id ON digest_items(chat_id, item_id);
+
+    -- Pending watch offers. Telegram caps callback_data at 64 BYTES, so the
+    -- full watch spec cannot ride in the button payload; we store it here and
+    -- put only the row id in the callback.
+    CREATE TABLE IF NOT EXISTS watch_offers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      label TEXT NOT NULL,
+      params_json TEXT NOT NULL DEFAULT '{}',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_conversations_chat ON conversations(chat_id);
   `);
+}
+
+// Store a watch offer and return its id, which is short enough to fit in
+// Telegram's 64-byte callback_data budget.
+function createWatchOffer(chatId, { kind, label, params }) {
+  const result = openDb().prepare(`
+    INSERT INTO watch_offers (chat_id, kind, label, params_json)
+    VALUES (?, ?, ?, ?)
+  `).run(String(chatId), String(kind), String(label), JSON.stringify(params || {}));
+  // Keep the table small — only recent offers can still be tapped.
+  openDb().prepare(`
+    DELETE FROM watch_offers
+    WHERE id IN (SELECT id FROM watch_offers WHERE chat_id = ? ORDER BY id DESC LIMIT -1 OFFSET 50)
+  `).run(String(chatId));
+  return Number(result.lastInsertRowid);
+}
+
+function getWatchOffer(chatId, id) {
+  const row = openDb()
+    .prepare('SELECT * FROM watch_offers WHERE chat_id = ? AND id = ?')
+    .get(String(chatId), Number(id));
+  if (!row) return null;
+  let params = {};
+  try { params = JSON.parse(row.params_json); } catch {}
+  return { id: row.id, kind: row.kind, label: row.label, params };
 }
 
 function recordTelemetry({ chatId = null, kind, label, status, durationMs, detail = '' }) {
@@ -323,4 +361,6 @@ module.exports = {
   recordDigestItems,
   getDigestItems,
   resolveDigestReference,
+  createWatchOffer,
+  getWatchOffer,
 };

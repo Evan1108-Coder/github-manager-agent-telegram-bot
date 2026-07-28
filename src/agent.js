@@ -1,5 +1,5 @@
 const { getConfig } = require('./config');
-const { addConversation, getConversation, getSetting, setSetting, openDb, recordTelemetry, resolveDigestReference } = require('./db');
+const { addConversation, getConversation, getSetting, setSetting, openDb, recordTelemetry, resolveDigestReference, createWatchOffer, getWatchOffer } = require('./db');
 const { GitHubClient } = require('./github/client');
 const { auditRepoPresentation } = require('./github/audit');
 const { chat, chooseDefaultModel, getAvailableModels } = require('./llm/providers');
@@ -12,7 +12,7 @@ const { languagePolicy } = require('./utils/language');
 const { classifyComplexity, StagedStatus, STAGES } = require('./utils/staged');
 const { runWithDeadline, DeadlineError, LIMITS } = require('./utils/guard');
 const { renderJob, renderAudit } = require('./renderers');
-const { buildTrendDigest, buildStatsReport, buildDailySummary, runProfileUpdate, auditOneRepo } = require('./jobs');
+const { buildTrendDigest, buildStatsReport, buildDailySummary, runProfileUpdate, auditOneRepo, answerMetricQuery } = require('./jobs');
 const { parseGithubWriteRequest, parseGithubReadRequest } = require('./planner');
 const { requestApproval, handleApprovalDecision } = require('./approvals');
 const { replaceLine, textDiff } = require('./utils/diff');
@@ -167,6 +167,30 @@ async function handleTextInner(ctx, text, context = {}) {
       }
       return sendLong(ctx, text);
     }));
+  }
+
+  // /compare owner/repo [owner/repo2] — compare NAMED repos, not account-wide
+  // stats. This must come BEFORE the broad stats gate below, which would
+  // otherwise swallow "compare stars for X" and return account totals.
+  if (/\bcompare\b/i.test(normalized)) {
+    const named = [...String(normalized).matchAll(/\b([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\b/g)].map(m => m[1]);
+    const username = getSetting('github_username', getConfig().githubUsername);
+    // Bare repo names ("compare stars for setupr and polyedge") resolve against
+    // the configured account.
+    const bare = named.length ? [] : [...String(normalized).matchAll(/["'`]([A-Za-z0-9_.-]+)["'`]/g)].map(m => `${username}/${m[1]}`);
+    const repos = [...new Set([...named, ...bare])];
+    if (repos.length) {
+      await reply(ctx, `📊 <b>Comparing ${escapeHtml(repos.join(', '))}…</b>`);
+      return withFriendlyFailure(ctx, () => withTyping(ctx, async () => {
+        // answerMetricQuery decides which metrics to fetch from keywords in the
+        // text. A bare "compare a b" names no metric, so default to stars rather
+        // than reporting "No metric available" for every repo.
+        const metricText = /\b(star|fail|error|workflow)\b/i.test(normalized) ? normalized : `${normalized} stars`;
+        const text = await answerMetricQuery(metricText, { prefetchRepos: repos });
+        return sendLong(ctx, text);
+      }));
+    }
+    return reply(ctx, '📊 <b>Which repos?</b>\nTry <code>/compare owner/repo-a owner/repo-b</code> — I need exact repo names so I fetch real numbers instead of guessing.');
   }
 
   if (/\b(stats|stars|popularity|views|forks)\b/i.test(normalized) && !/audit|readme/i.test(normalized)) {
@@ -326,13 +350,17 @@ function extractDefaultRepo(text) {
 // OFFER to watch — this is the opt-in gate. We show the current state and ask;
 // the background watch only starts if the user taps "Yes, keep watching".
 async function offerWatch(ctx, intent) {
-  const token = `${intent.kind}:${Buffer.from(JSON.stringify({ p: intent.params, l: intent.label })).toString('base64url').slice(0, 3500)}`;
+  // Telegram caps callback_data at 64 BYTES. The old code base64-encoded the
+  // whole spec and sliced to 3500, so Telegram rejected the keyboard and the
+  // user saw nothing at all. Persist the spec, send only its row id.
+  const offerId = createWatchOffer(ctx.chat.id, { kind: intent.kind, label: intent.label, params: intent.params });
   const keyboard = new InlineKeyboard()
-    .text('👀 Yes, keep watching', `watch:start:${token}`)
+    .text('👀 Yes, keep watching', `watch:start:${offerId}`)
     .text('❌ No thanks', 'watch:decline');
-  return ctx.reply(
+  return sendLong(
+    ctx,
     `⏳ <b>Not done yet.</b>\nI can keep an eye on ${escapeHtml(intent.label)} in the background and ping you the moment it happens — you can keep chatting meanwhile. Want me to?`,
-    { parse_mode: 'HTML', reply_markup: keyboard }
+    { reply_markup: keyboard }
   );
 }
 
@@ -366,22 +394,18 @@ async function handleWatchCallback(ctx) {
     return;
   }
   if (action === 'start') {
-    const token = rest.join(':');
-    const kind = token.split(':')[0];
-    const encoded = token.slice(kind.length + 1);
-    let spec;
-    try {
-      spec = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
-    } catch {
+    const offerId = rest.join(':');
+    const spec = getWatchOffer(ctx.chat.id, offerId);
+    if (!spec) {
       await ctx.answerCallbackQuery('That watch offer expired.');
       return;
     }
     const wm = getWatchManager(ctx.api ? { api: ctx.api } : undefined);
     try {
-      const { id } = wm.startWatch({ chatId: ctx.chat.id, label: spec.l, kind, params: spec.p });
+      const { id } = wm.startWatch({ chatId: ctx.chat.id, label: spec.label, kind: spec.kind, params: spec.params });
       await ctx.answerCallbackQuery('Watching in the background.');
       try {
-        await ctx.editMessageText(`👀 <b>Watching (#${id}).</b>\nI’ll ping you the moment ${escapeHtml(spec.l)} — keep chatting, I’m on it in the background. Stop with “stop watch #${id}”.`, { parse_mode: 'HTML' });
+        await ctx.editMessageText(`👀 <b>Watching (#${id}).</b>\nI’ll ping you the moment ${escapeHtml(spec.label)} — keep chatting, I’m on it in the background. Stop with “stop watch #${id}”.`, { parse_mode: 'HTML' });
       } catch {}
     } catch (err) {
       await ctx.answerCallbackQuery('Could not start.');
@@ -572,8 +596,13 @@ async function handleGithubRead(ctx, request) {
   }
   if (request.kind === 'inspect_repo_code') {
     const repo = await github.getRepo(request.repo);
-    let readme = '';
-    try { readme = await github.getReadme(request.repo); } catch {}
+    // getReadme() returns {content, path, sha} — pull the text out, never use the
+    // object as a string (that used to throw a TypeError and kill /readme).
+    let readmeText = '';
+    try {
+      const readmeFile = await github.getReadme(request.repo);
+      readmeText = String(readmeFile?.content || '');
+    } catch {}
     let workflows = [];
     try {
       const listing = await github.get(`/repos/${request.repo.split('/')[0]}/${request.repo.split('/')[1]}/contents/.github/workflows`);
@@ -581,10 +610,10 @@ async function handleGithubRead(ctx, request) {
     } catch {}
     const evidence = [
       `repo default branch: ${repo.default_branch || 'unknown'}`,
-      `README checked: ${readme ? `${readme.length} chars` : 'not found/readable'}`,
+      `README checked: ${readmeText ? `${readmeText.length} chars` : 'not found/readable'}`,
       `workflow files checked: ${workflows.length ? workflows.join(', ') : 'none found/readable'}`,
     ].join('; ');
-    const lower = readme.toLowerCase();
+    const lower = readmeText.toLowerCase();
     const hasDynamicBadge = /komarev|visitor|views|profile-views|github-readme-stats|streak-stats|github-profile-trophy|shields\.io/.test(lower);
     const hasWorkflow = workflows.length > 0;
     remember(ctx.chat.id, { action: `inspected repo code for ${request.repo}`, evidence, result: `dynamic badges/signals=${hasDynamicBadge}; workflows=${hasWorkflow}` });

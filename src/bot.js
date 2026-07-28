@@ -43,7 +43,9 @@ function createBot(token) {
 
   bot.command('status', ctx => {
     if (busyState.busy(ctx.chat.id)) return busyState.handleWhileBusy(ctx, 'status', { reply: message => sendLong(ctx, escapeHtml(message)) });
-    return handleText(ctx, 'status');
+    // Send "bot status" (not bare "status") so it hits the exact operational
+    // route in agent.js instead of falling through to an LLM guess.
+    return handleText(ctx, 'bot status');
   });
   bot.command('settings', ctx => handleText(ctx, 'settings'));
   bot.command('reset', ctx => handleText(ctx, 'reset setup'));
